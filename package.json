@@ -1,0 +1,14 @@
+{
+  "name": "flash-sale-store-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small store API with atomic stock reservation and idempotent orders",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
