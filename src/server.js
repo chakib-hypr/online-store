@@ -33,6 +33,7 @@ function initializeDatabase(db) {
       user_id TEXT NOT NULL,
       product_id INTEGER NOT NULL REFERENCES products(id),
       quantity INTEGER NOT NULL CHECK (quantity > 0),
+      unit_price_cents INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
 
@@ -44,6 +45,11 @@ function initializeDatabase(db) {
       PRIMARY KEY (user_id, key)
     );
   `);
+
+  const orderColumns = db.prepare('PRAGMA table_info(orders)').all().map((column) => column.name);
+  if (!orderColumns.includes('unit_price_cents')) {
+    db.exec('ALTER TABLE orders ADD COLUMN unit_price_cents INTEGER NOT NULL DEFAULT 0');
+  }
 
   const productCount = db.prepare('SELECT COUNT(*) AS count FROM products').get().count;
   if (productCount === 0) {
@@ -93,7 +99,8 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
 
   const getOrder = db.prepare(`
     SELECT o.id, o.user_id AS userId, o.product_id AS productId,
-      p.name AS productName, o.quantity, o.created_at AS createdAt
+      p.name AS productName, o.quantity, o.unit_price_cents AS unitPriceCents,
+      o.quantity * o.unit_price_cents AS totalCents, o.created_at AS createdAt
     FROM orders o JOIN products p ON p.id = o.product_id
     WHERE o.id = ?
   `);
@@ -109,7 +116,7 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
       return { order: getOrder.get(previous.orderId), replayed: true };
     }
 
-    const product = db.prepare('SELECT id FROM products WHERE id = ?').get(productId);
+    const product = db.prepare('SELECT id, price_cents AS priceCents FROM products WHERE id = ?').get(productId);
     if (!product) {
       return { notFound: true };
     }
@@ -118,12 +125,13 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
       'UPDATE products SET stock = stock - ? WHERE id = ? AND stock >= ?'
     ).run(quantity, productId, quantity);
     if (stockUpdate.changes !== 1) {
-      return { soldOut: true };
+      const { stock } = db.prepare('SELECT stock FROM products WHERE id = ?').get(productId);
+      return stock === 0 ? { soldOut: true } : { insufficient: true, available: stock };
     }
 
     const orderResult = db.prepare(
-      'INSERT INTO orders (user_id, product_id, quantity) VALUES (?, ?, ?)'
-    ).run(userId, productId, quantity);
+      'INSERT INTO orders (user_id, product_id, quantity, unit_price_cents) VALUES (?, ?, ?, ?)'
+    ).run(userId, productId, quantity, product.priceCents);
     const orderId = Number(orderResult.lastInsertRowid);
 
     db.prepare(
@@ -134,10 +142,15 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
   });
 
   const server = http.createServer(async (request, response) => {
-    const url = new URL(request.url, 'http://localhost');
-    const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-
     try {
+      let segments;
+      try {
+        const url = new URL(request.url, 'http://localhost');
+        segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+      } catch {
+        return sendJson(response, 400, { error: 'Malformed URL' });
+      }
+
       if (request.method === 'GET' && segments.length === 0) {
         return sendJson(response, 200, {
           name: 'Flash Sale Store API',
@@ -191,7 +204,14 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
           return sendJson(response, 409, { error: 'Idempotency-Key was already used with a different request' });
         }
         if (result.notFound) return sendJson(response, 404, { error: 'Product not found' });
-        if (result.soldOut) return sendJson(response, 409, { error: 'Insufficient stock' });
+        if (result.soldOut) return sendJson(response, 409, { error: 'Sold out', code: 'SOLD_OUT' });
+        if (result.insufficient) {
+          return sendJson(response, 409, {
+            error: 'Insufficient stock',
+            code: 'INSUFFICIENT_STOCK',
+            availableStock: result.available
+          });
+        }
 
         return sendJson(response, result.replayed ? 200 : 201, {
           order: result.order,
@@ -202,7 +222,8 @@ function createStoreServer({ dbPath = path.join(process.cwd(), 'store.sqlite') }
       if (request.method === 'GET' && segments.length === 3 && segments[0] === 'users' && segments[2] === 'orders') {
         const orders = db.prepare(`
           SELECT o.id, o.user_id AS userId, o.product_id AS productId,
-            p.name AS productName, o.quantity, o.created_at AS createdAt
+            p.name AS productName, o.quantity, o.unit_price_cents AS unitPriceCents,
+      o.quantity * o.unit_price_cents AS totalCents, o.created_at AS createdAt
           FROM orders o JOIN products p ON p.id = o.product_id
           WHERE o.user_id = ? ORDER BY o.id DESC
         `).all(segments[1]);

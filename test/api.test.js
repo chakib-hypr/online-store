@@ -101,3 +101,73 @@ test('root lists available API routes', async () => {
   assert.equal(body.name, 'Flash Sale Store API');
   assert.equal(body.routes.products, 'GET /products');
 });
+
+test('same idempotency key sent concurrently creates exactly one order', async () => {
+  const send = () => fetch(`${baseUrl}/orders`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'idempotency-key': 'double-click' },
+    body: JSON.stringify({ userId: 'customer-a', productId: 1, quantity: 1 })
+  });
+  const responses = await Promise.all(Array.from({ length: 20 }, send));
+
+  assert.equal(responses.filter((response) => response.status === 201).length, 1);
+  assert.equal(responses.filter((response) => response.status === 200).length, 19);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS count FROM orders').get().count, 1);
+  assert.equal(app.db.prepare('SELECT stock FROM products WHERE id = 1').get().stock, 23);
+});
+
+test('sold out and insufficient stock return distinct messages', async () => {
+  app.db.prepare('UPDATE products SET stock = 2 WHERE id = 1').run();
+  const order = (quantity, key) => fetch(`${baseUrl}/orders`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'idempotency-key': key },
+    body: JSON.stringify({ userId: 'customer-a', productId: 1, quantity })
+  });
+
+  const tooMany = await order(3, 'k1');
+  assert.equal(tooMany.status, 409);
+  const tooManyBody = await tooMany.json();
+  assert.equal(tooManyBody.code, 'INSUFFICIENT_STOCK');
+  assert.equal(tooManyBody.availableStock, 2);
+
+  assert.equal((await order(2, 'k2')).status, 201);
+  const soldOut = await order(1, 'k3');
+  assert.equal(soldOut.status, 409);
+  assert.equal((await soldOut.json()).code, 'SOLD_OUT');
+});
+
+test('invalid orders are rejected', async () => {
+  const post = (headers, body) => fetch(`${baseUrl}/orders`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body
+  });
+  const valid = JSON.stringify({ userId: 'u', productId: 1, quantity: 1 });
+
+  assert.equal((await post({}, valid)).status, 400);
+  assert.equal((await post({ 'idempotency-key': 'a' }, '{not json')).status, 400);
+  assert.equal((await post({ 'idempotency-key': 'b' }, JSON.stringify({ userId: 'u', productId: 1, quantity: 0 }))).status, 400);
+  assert.equal((await post({ 'idempotency-key': 'c' }, JSON.stringify({ userId: 'u', productId: 1, quantity: 1.5 }))).status, 400);
+  assert.equal((await post({ 'idempotency-key': 'd' }, JSON.stringify({ userId: 'u', productId: 999, quantity: 1 }))).status, 404);
+  assert.equal(app.db.prepare('SELECT COUNT(*) AS count FROM orders').get().count, 0);
+});
+
+test('malformed URL encoding does not crash the server', async () => {
+  const bad = await fetch(`${baseUrl}/products/%E0%A4%A`);
+  assert.equal(bad.status, 400);
+  const ok = await fetch(`${baseUrl}/products`);
+  assert.equal(ok.status, 200);
+});
+
+test('order stores the price at purchase time', async () => {
+  const created = await (await fetch(`${baseUrl}/orders`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'idempotency-key': 'price-1' },
+    body: JSON.stringify({ userId: 'customer-a', productId: 1, quantity: 2 })
+  })).json();
+  app.db.prepare('UPDATE products SET price_cents = 9999 WHERE id = 1').run();
+
+  const detail = await (await fetch(`${baseUrl}/users/customer-a/orders/${created.order.id}`)).json();
+  assert.equal(detail.order.unitPriceCents, 5499);
+  assert.equal(detail.order.totalCents, 10998);
+});
